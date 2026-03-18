@@ -1,0 +1,1523 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>시카고 성 김대건 성당 도서관</title>
+
+<script>
+// Minimal XLSX/CSV reader - no external dependencies
+// Supports: .csv, .xlsx (basic), .xls not supported (binary format)
+const MiniXLSX = (() => {
+  // --- CSV parser ---
+  function parseCSV(text) {
+    const rows = [];
+    const lines = text.split(/\r?\n/);
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const row = [];
+      let inQ = false, cur = '';
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (c === '"') { inQ = !inQ; }
+        else if (c === ',' && !inQ) { row.push(cur); cur = ''; }
+        else cur += c;
+      }
+      row.push(cur);
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  // --- XLSX parser (uses browser's DecompressionStream or manual ZIP) ---
+  // XLSX is a ZIP containing xl/worksheets/sheet1.xml
+  // We'll parse the ZIP manually using DataView
+
+  function u8str(arr, off, len) {
+    let s = '';
+    for (let i = 0; i < len; i++) s += String.fromCharCode(arr[off + i]);
+    return s;
+  }
+
+  function readZipEntries(buf) {
+    const u8 = new Uint8Array(buf);
+    const view = new DataView(buf);
+    const entries = {};
+    let i = 0;
+    while (i < u8.length - 4) {
+      if (view.getUint32(i, true) === 0x04034b50) {
+        const flags = view.getUint16(i + 6, true);
+        const comp = view.getUint16(i + 8, true);
+        const csize = view.getUint32(i + 18, true);
+        const usize = view.getUint32(i + 22, true);
+        const fnlen = view.getUint16(i + 26, true);
+        const exlen = view.getUint16(i + 28, true);
+        const fname = u8str(u8, i + 30, fnlen);
+        const dataOff = i + 30 + fnlen + exlen;
+        let data;
+        if (comp === 0) {
+          data = u8.slice(dataOff, dataOff + usize);
+        } else if (comp === 8) {
+          try {
+            const compressed = u8.slice(dataOff, dataOff + csize);
+            // Use pako-free inflate via raw deflate trick
+            data = inflateRaw(compressed, usize);
+          } catch(e) { data = null; }
+        }
+        if (data) entries[fname] = data;
+        i = dataOff + csize;
+      } else { i++; }
+    }
+    return entries;
+  }
+
+  function inflateRaw(compressed, usize) {
+    // Use browser DecompressionStream if available (Chrome 80+)
+    // Synchronous fallback not possible without library; return null
+    return null; // async path needed
+  }
+
+  async function inflateRawAsync(compressed) {
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    writer.write(compressed);
+    writer.close();
+    const chunks = [];
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    let len = chunks.reduce((a,c)=>a+c.length,0);
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.length; }
+    return out;
+  }
+
+  async function readZipEntriesAsync(buf) {
+    const u8 = new Uint8Array(buf);
+    const view = new DataView(buf);
+    const entries = {};
+    let i = 0;
+    while (i < u8.length - 4) {
+      if (view.getUint32(i, true) === 0x04034b50) {
+        const comp = view.getUint16(i + 8, true);
+        const csize = view.getUint32(i + 18, true);
+        const usize = view.getUint32(i + 22, true);
+        const fnlen = view.getUint16(i + 26, true);
+        const exlen = view.getUint16(i + 28, true);
+        const fname = u8str(u8, i + 30, fnlen);
+        const dataOff = i + 30 + fnlen + exlen;
+        let data;
+        if (comp === 0) {
+          data = u8.slice(dataOff, dataOff + usize);
+        } else if (comp === 8) {
+          data = await inflateRawAsync(u8.slice(dataOff, dataOff + csize));
+        }
+        if (data) entries[fname] = data;
+        i = dataOff + csize;
+      } else { i++; }
+    }
+    return entries;
+  }
+
+  function xmlDecode(s) { return s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#(\d+);/g,(_,n)=>String.fromCharCode(n)); }
+
+  function parseSheetXML(xml, sharedStrings) {
+    const rows = [];
+    const rowRe = /<row[^>]*>([\s\S]*?)<\/row>/g;
+    const cellRe = /<c\s([^>]*)>([\s\S]*?)<\/c>/g;
+    const vRe = /<v>([\s\S]*?)<\/v>/;
+    const tRe = /\bt="([^"]+)"/;
+    const rRe = /\br="([A-Z]+)(\d+)"/;
+    let rowM;
+    while ((rowM = rowRe.exec(xml)) !== null) {
+      const rowNum = parseInt((rowM[0].match(/r="(\d+)"/) || [])[1] || rows.length + 1) - 1;
+      while (rows.length <= rowNum) rows.push([]);
+      const rowCells = {};
+      let cellM;
+      cellRe.lastIndex = 0;
+      const rowXML = rowM[1];
+      while ((cellM = cellRe.exec(rowXML)) !== null) {
+        const attrs = cellM[1], inner = cellM[2];
+        const rMatch = attrs.match(/r="([A-Z]+)\d+"/);
+        if (!rMatch) continue;
+        const col = rMatch[1].split('').reduce((a,c)=>a*26+(c.charCodeAt(0)-64),0) - 1;
+        const tMatch = attrs.match(/t="([^"]+)"/);
+        const vMatch = inner.match(/<v>([\s\S]*?)<\/v>/);
+        let val = '';
+        if (vMatch) {
+          val = vMatch[1];
+          if (tMatch && tMatch[1] === 's') val = sharedStrings[parseInt(val)] || '';
+        }
+        rowCells[col] = xmlDecode(val);
+      }
+      const maxCol = Math.max(-1, ...Object.keys(rowCells).map(Number));
+      for (let c = 0; c <= maxCol; c++) rows[rowNum][c] = rowCells[c] !== undefined ? rowCells[c] : '';
+    }
+    return rows.filter(r=>r.length);
+  }
+
+  function parseSharedStrings(xml) {
+    const strs = [];
+    const re = /<si>([\s\S]*?)<\/si>/g;
+    const tRe = /<t[^>]*>([\s\S]*?)<\/t>/g;
+    let m;
+    while ((m = re.exec(xml)) !== null) {
+      let s = '', tm;
+      tRe.lastIndex = 0;
+      while ((tm = tRe.exec(m[1])) !== null) s += xmlDecode(tm[1]);
+      strs.push(s);
+    }
+    return strs;
+  }
+
+  function u8ToStr(u8) {
+    const dec = new TextDecoder('utf-8');
+    return dec.decode(u8);
+  }
+
+  async function readXLSX(buf) {
+    const entries = await readZipEntriesAsync(buf);
+    const sharedStringsXML = entries['xl/sharedStrings.xml'] ? u8ToStr(entries['xl/sharedStrings.xml']) : '';
+    const sharedStrings = sharedStringsXML ? parseSharedStrings(sharedStringsXML) : [];
+    // Find first sheet
+    const sheetKey = Object.keys(entries).find(k => /xl\/worksheets\/sheet\d+\.xml/.test(k));
+    if (!sheetKey) return [];
+    const sheetXML = u8ToStr(entries[sheetKey]);
+    return parseSheetXML(sheetXML, sharedStrings);
+  }
+
+  return {
+    async read(file) {
+      return new Promise((resolve, reject) => {
+        const ext = file.name.split('.').pop().toLowerCase();
+        const reader = new FileReader();
+        if (ext === 'csv') {
+          reader.onload = e => resolve(parseCSV(e.target.result));
+          reader.readAsText(file, 'utf-8');
+        } else if (ext === 'xlsx') {
+          reader.onload = async e => {
+            try { resolve(await readXLSX(e.target.result)); }
+            catch(err) { reject(err); }
+          };
+          reader.readAsArrayBuffer(file);
+        } else {
+          reject(new Error('지원하지 않는 파일 형식입니다 (.xlsx, .csv만 가능)'));
+        }
+      });
+    }
+  };
+})();
+
+</script>
+<style>
+  :root {
+    --bg: #f7f3ee;
+    --bg2: #fffdf9;
+    --bg3: #f0ebe3;
+    --bg4: #e8e0d4;
+    --gold: #8b6914;
+    --gold2: #b8860b;
+    --gold3: #d4a843;
+    --accent: #5c3d1e;
+    --red: #9b2335;
+    --green: #2d6a4f;
+    --blue: #1e4d7b;
+    --text: #2c1f0e;
+    --text2: #7a6650;
+    --text3: #a89278;
+    --border: rgba(139,105,20,0.18);
+    --border2: rgba(139,105,20,0.08);
+    --shadow: 0 2px 16px rgba(92,61,30,0.10);
+    --shadow2: 0 8px 32px rgba(92,61,30,0.15);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    font-size: 14px;
+    /* Prevent iOS font size adjustment */
+    -webkit-text-size-adjust: 100%;
+  }
+  /* Prevent iOS zoom on input focus (font-size must be ≥ 16px on mobile) */
+  @media (max-width: 700px) {
+    input, select, textarea { font-size: 16px !important; }
+  }
+
+  /* HEADER */
+  header {
+    background: #1a2744;
+    padding: 0 28px;
+    display: flex; align-items: center; justify-content: space-between;
+    height: 64px;
+    position: sticky; top: 0; z-index: 100;
+    box-shadow: 0 2px 16px rgba(26,39,68,0.35);
+  }
+  .logo { display: flex; align-items: center; gap: 12px; }
+  .logo-cross {
+    width: 36px; height: 36px; position: relative;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .logo-cross::before {
+    content: '✝';
+    font-size: 22px; color: var(--gold3);
+  }
+  .logo-text h1 {
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif;
+    font-size: 1.25rem; color: #ffffff; letter-spacing: 0.05em;
+  }
+  .logo-text p { font-size: 0.7rem; color: #c9a84c; letter-spacing: 0.12em; margin-top: 1px; }
+  .header-stats { display: flex; gap: 24px; }
+  .hstat { text-align: center; }
+  .hstat-num {
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif;
+    font-size: 1.3rem; color: var(--gold3); line-height: 1;
+  }
+  .hstat-label { font-size: 0.65rem; color: rgba(201,168,76,0.85); margin-top: 2px; letter-spacing: 0.06em; }
+
+  /* NAV */
+  nav {
+    background: var(--bg2);
+    border-bottom: 2px solid var(--border);
+    padding: 0 28px;
+    display: flex; gap: 0;
+  }
+  .tab {
+    padding: 14px 22px;
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', sans-serif;
+    font-size: 0.88rem; font-weight: 500;
+    color: var(--text2);
+    cursor: pointer; border: none; background: none;
+    border-bottom: 3px solid transparent;
+    transition: all 0.2s; margin-bottom: -2px;
+    letter-spacing: 0.03em;
+  }
+  .tab:hover { color: var(--accent); background: var(--bg3); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--gold2); font-weight: 700; }
+
+  /* MAIN */
+  main { padding: 28px; max-width: 1440px; margin: 0 auto; }
+  .page { display: none; }
+  .page.active { display: block; }
+
+  /* SECTION HEADER */
+  .section-header {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    margin-bottom: 20px; flex-wrap: wrap; gap: 12px;
+  }
+  .section-header h2 {
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif;
+    font-size: 1.2rem; color: var(--accent); font-weight: 700;
+  }
+  .section-header p { font-size: 0.8rem; color: var(--text3); margin-top: 3px; }
+  .section-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* BUTTONS */
+  .btn {
+    padding: 9px 18px; border: none; border-radius: 6px;
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', sans-serif;
+    font-size: 0.83rem; font-weight: 500;
+    cursor: pointer; transition: all 0.18s;
+    display: inline-flex; align-items: center; gap: 5px;
+    white-space: nowrap;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #3d2810; }
+  .btn-gold { background: var(--gold2); color: #fff; }
+  .btn-gold:hover { background: var(--gold); }
+  .btn-secondary { background: var(--bg3); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: var(--bg4); border-color: var(--gold3); }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-danger:hover { background: #7a1b28; }
+  .btn-success { background: var(--green); color: #fff; }
+  .btn-success:hover { background: #1e4d38; }
+  .btn-sm { padding: 6px 12px; font-size: 0.78rem; }
+
+  /* SEARCH BAR */
+  .search-bar {
+    display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; align-items: center;
+  }
+  .search-wrap { flex: 1; min-width: 200px; position: relative; }
+  .search-wrap input {
+    width: 100%; padding: 10px 14px 10px 38px;
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text);
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', sans-serif; font-size: 0.88rem;
+    outline: none; transition: border-color 0.2s;
+  }
+  .search-wrap input:focus { border-color: var(--gold2); box-shadow: 0 0 0 3px rgba(139,105,20,0.08); }
+  .search-wrap input::placeholder { color: var(--text3); }
+  .search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--text3); font-size: 0.9rem; }
+  select.filter {
+    padding: 10px 14px; background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text);
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', sans-serif; font-size: 0.85rem;
+    outline: none; cursor: pointer;
+  }
+  select.filter:focus { border-color: var(--gold2); }
+
+  /* EXCEL UPLOAD AREA */
+  .upload-zone {
+    border: 2px dashed var(--border);
+    border-radius: 10px; padding: 28px;
+    text-align: center; background: var(--bg2);
+    margin-bottom: 20px; cursor: pointer;
+    transition: all 0.2s; position: relative;
+  }
+  .upload-zone:hover, .upload-zone.dragover {
+    border-color: var(--gold2); background: rgba(184,134,11,0.04);
+  }
+  .upload-zone input[type=file] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  }
+  .upload-icon { font-size: 2.4rem; margin-bottom: 10px; }
+  .upload-zone h3 { font-size: 1rem; color: var(--accent); font-weight: 600; margin-bottom: 6px; }
+  .upload-zone p { font-size: 0.82rem; color: var(--text3); }
+  .upload-zone .hint {
+    display: inline-block; margin-top: 10px; padding: 4px 12px;
+    background: var(--bg3); border-radius: 20px;
+    font-size: 0.75rem; color: var(--text2); border: 1px solid var(--border);
+  }
+
+  /* PREVIEW TABLE */
+  .preview-box {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden; margin-bottom: 20px;
+    display: none;
+  }
+  .preview-header {
+    padding: 14px 20px; background: var(--bg3); border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .preview-header h3 { font-size: 0.9rem; color: var(--accent); font-weight: 600; }
+  .preview-scroll { overflow-x: auto; max-height: 260px; overflow-y: auto; }
+  .preview-scroll table { width: 100%; border-collapse: collapse; }
+  .preview-scroll th {
+    padding: 10px 14px; background: rgba(92,61,30,0.06);
+    font-size: 0.75rem; color: var(--gold); letter-spacing: 0.06em;
+    text-align: left; border-bottom: 1px solid var(--border);
+    font-weight: 700; white-space: nowrap;
+  }
+  .preview-scroll td {
+    padding: 9px 14px; border-bottom: 1px solid var(--border2);
+    font-size: 0.85rem; max-width: 200px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .preview-scroll tr:hover td { background: rgba(139,105,20,0.04); }
+  .col-map { padding: 16px 20px; background: var(--bg3); border-top: 1px solid var(--border); }
+  .col-map h4 { font-size: 0.82rem; color: var(--text2); margin-bottom: 10px; font-weight: 600; }
+  .col-map-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .col-map-item { display: flex; align-items: center; gap: 8px; }
+  .col-map-item label { font-size: 0.8rem; color: var(--accent); font-weight: 600; white-space: nowrap; }
+  .col-map-item select {
+    padding: 6px 10px; border: 1px solid var(--border);
+    border-radius: 5px; background: var(--bg2);
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', sans-serif; font-size: 0.8rem; color: var(--text);
+    outline: none;
+  }
+  .import-actions { display: flex; gap: 10px; margin-top: 12px; }
+
+  /* BOOKS GRID */
+  .books-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 16px;
+  }
+  .book-card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 18px;
+    transition: all 0.18s; position: relative;
+    box-shadow: var(--shadow);
+  }
+  .book-card:hover { box-shadow: var(--shadow2); transform: translateY(-2px); border-color: rgba(139,105,20,0.35); }
+  .book-spine {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+    border-radius: 8px 0 0 8px; background: var(--gold3);
+  }
+  .book-card.borrowed .book-spine { background: var(--red); }
+  .book-title {
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif;
+    font-size: 0.98rem; font-weight: 700; color: var(--accent);
+    margin-bottom: 3px; line-height: 1.4;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .book-author { font-size: 0.82rem; color: var(--text2); margin-bottom: 10px; }
+  .book-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 12px; }
+  .tag {
+    padding: 2px 9px; border-radius: 20px; font-size: 0.72rem;
+    background: rgba(139,105,20,0.1); color: var(--gold2);
+    border: 1px solid rgba(139,105,20,0.2); font-weight: 500;
+  }
+  .badge {
+    padding: 2px 9px; border-radius: 20px; font-size: 0.72rem; font-weight: 600;
+  }
+  .badge-available { background: rgba(45,106,79,0.12); color: var(--green); border: 1px solid rgba(45,106,79,0.25); }
+  .badge-borrowed { background: rgba(155,35,53,0.12); color: var(--red); border: 1px solid rgba(155,35,53,0.25); }
+  .book-borrower { font-size: 0.78rem; color: var(--text3); margin-bottom: 8px; font-style: italic; }
+  .book-actions { display: flex; gap: 6px; }
+  .book-actions .btn { flex: 1; justify-content: center; padding: 7px 10px; font-size: 0.78rem; }
+
+  /* TABLE */
+  .table-wrap { overflow-x: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }
+  table { width: 100%; border-collapse: collapse; }
+  thead { background: var(--bg3); }
+  th {
+    padding: 12px 16px; text-align: left;
+    font-size: 0.75rem; letter-spacing: 0.06em; color: var(--gold);
+    border-bottom: 2px solid var(--border); font-weight: 700; white-space: nowrap;
+  }
+  td { padding: 12px 16px; border-bottom: 1px solid var(--border2); font-size: 0.85rem; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(139,105,20,0.04); }
+  .overdue-text { color: var(--red); font-weight: 600; }
+
+  /* MEMBERS */
+  .members-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
+  .member-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 18px; box-shadow: var(--shadow); transition: all 0.18s;
+  }
+  .member-card:hover { box-shadow: var(--shadow2); border-color: rgba(139,105,20,0.35); }
+  .member-top { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+  .avatar {
+    width: 44px; height: 44px; border-radius: 50%; flex-shrink: 0;
+    background: linear-gradient(135deg, var(--accent), var(--gold2));
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif; font-size: 1rem; color: #fff; font-weight: 700;
+  }
+  .member-name { font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif; font-size: 0.95rem; font-weight: 700; color: var(--accent); }
+  .member-info { font-size: 0.78rem; color: var(--text3); margin-top: 2px; }
+  .member-stats { display: flex; gap: 14px; margin-bottom: 12px; }
+  .mstat { font-size: 0.78rem; color: var(--text3); }
+  .mstat span { color: var(--gold2); font-weight: 700; }
+  .member-actions { display: flex; gap: 6px; }
+
+  /* DASHBOARD */
+  .dash-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 28px; }
+  .dash-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 20px 16px; text-align: center; box-shadow: var(--shadow);
+  }
+  .dash-icon { font-size: 1.8rem; margin-bottom: 8px; }
+  .dash-num { font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif; font-size: 1.8rem; color: var(--accent); font-weight: 700; }
+  .dash-label { font-size: 0.72rem; color: var(--text3); margin-top: 4px; letter-spacing: 0.04em; }
+  .dash-two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .dash-section { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 20px; box-shadow: var(--shadow); }
+  .dash-section h3 { font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif; font-size: 0.95rem; color: var(--accent); margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+  .dash-item { padding: 9px 0; border-bottom: 1px solid var(--border2); display: flex; justify-content: space-between; align-items: center; }
+  .dash-item:last-child { border-bottom: none; }
+  .dash-item-title { font-size: 0.85rem; color: var(--text); }
+  .dash-item-sub { font-size: 0.75rem; color: var(--text3); margin-top: 2px; }
+
+  /* MODAL */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(44,31,14,0.6);
+    display: none; align-items: center; justify-content: center;
+    z-index: 200; backdrop-filter: blur(4px);
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 12px; padding: 28px; width: 460px; max-width: 96vw;
+    box-shadow: 0 20px 60px rgba(44,31,14,0.25); max-height: 92vh; overflow-y: auto;
+  }
+  .modal h2 {
+    font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', 'Batang', '바탕', serif; font-size: 1.1rem; color: var(--accent);
+    margin-bottom: 20px; padding-bottom: 12px; border-bottom: 2px solid var(--border);
+  }
+  .form-group { margin-bottom: 14px; }
+  .form-group label { display: block; font-size: 0.75rem; color: var(--text2); font-weight: 600; letter-spacing: 0.04em; margin-bottom: 5px; }
+  .form-group input, .form-group select, .form-group textarea {
+    width: 100%; padding: 9px 13px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', sans-serif; font-size: 0.88rem;
+    outline: none; resize: vertical; transition: border-color 0.2s;
+  }
+  .form-group input:focus, .form-group select:focus { border-color: var(--gold2); box-shadow: 0 0 0 3px rgba(139,105,20,0.08); }
+  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+  /* TOAST */
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; z-index: 999;
+    background: var(--accent); color: #fff;
+    padding: 12px 20px; border-radius: 8px;
+    font-size: 0.88rem; font-family: 'Apple SD Gothic Neo', 'Malgun Gothic', '맑은 고딕', sans-serif;
+    box-shadow: 0 4px 20px rgba(92,61,30,0.4);
+    transform: translateY(60px); opacity: 0; transition: all 0.3s;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+
+  /* EMPTY STATE */
+  .empty { text-align: center; padding: 48px 20px; color: var(--text3); }
+  .empty .eicon { font-size: 2.8rem; margin-bottom: 12px; }
+  .empty p { font-size: 0.9rem; }
+
+  /* ── MOBILE (≤ 700px) ── */
+  @media (max-width: 700px) {
+
+    /* Header */
+    header {
+      padding: 0 14px;
+      height: auto;
+      min-height: 56px;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding-top: 8px;
+      padding-bottom: 8px;
+    }
+    .logo-cross { width: 28px; height: 28px; }
+    .logo-cross::before { font-size: 17px; }
+    .logo-text h1 { font-size: 1rem; }
+    .logo-text p { font-size: 0.62rem; }
+    .header-stats {
+      width: 100%;
+      display: flex; justify-content: space-around;
+      padding: 4px 0 2px;
+      gap: 0;
+      border-top: 1px solid rgba(255,255,255,0.1);
+    }
+    .hstat { flex: 1; text-align: center; }
+    .hstat-num { font-size: 1.1rem; }
+    .hstat-label { font-size: 0.6rem; }
+
+    /* Nav — scrollable horizontal tabs */
+    nav {
+      padding: 0;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+    }
+    nav::-webkit-scrollbar { display: none; }
+    .tab {
+      padding: 12px 14px;
+      font-size: 0.8rem;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+
+    /* Main */
+    main { padding: 14px 12px; }
+
+    /* Section header */
+    .section-header { flex-direction: column; align-items: flex-start; gap: 10px; }
+    .section-actions { width: 100%; }
+    .section-actions .btn { flex: 1; justify-content: center; }
+
+    /* Search bar */
+    .search-bar { flex-direction: column; gap: 8px; }
+    .search-wrap { min-width: unset; width: 100%; }
+    select.filter { width: 100%; }
+
+    /* Books grid → single column */
+    .books-grid { grid-template-columns: 1fr; gap: 12px; }
+    .book-card { padding: 14px 14px 14px 18px; }
+    .book-title { font-size: 0.93rem; }
+    .book-actions .btn { padding: 8px 6px; font-size: 0.76rem; }
+
+    /* Table → card layout */
+    .table-wrap { border: none; box-shadow: none; background: transparent; }
+    table, thead, tbody, th, td, tr { display: block; }
+    thead { display: none; }
+    tbody tr {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 10px;
+      padding: 12px 14px;
+      box-shadow: var(--shadow);
+      position: relative;
+    }
+    tbody td {
+      padding: 4px 0;
+      border: none;
+      font-size: 0.84rem;
+      display: flex; align-items: flex-start; gap: 8px;
+    }
+    tbody td::before {
+      content: attr(data-label);
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: var(--text3);
+      letter-spacing: 0.04em;
+      min-width: 70px;
+      flex-shrink: 0;
+      padding-top: 1px;
+    }
+    tbody td:last-child {
+      margin-top: 8px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border2);
+    }
+    tbody td:last-child::before { display: none; }
+    .btn-sm { padding: 8px 14px; font-size: 0.82rem; }
+
+    /* Members grid → single column */
+    .members-grid { grid-template-columns: 1fr; gap: 10px; }
+
+    /* Dashboard */
+    .dash-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .dash-card { padding: 14px 10px; }
+    .dash-num { font-size: 1.5rem; }
+    .dash-two { grid-template-columns: 1fr; gap: 14px; }
+
+    /* Modal */
+    .modal-overlay { align-items: flex-end; }
+    .modal {
+      width: 100%;
+      max-width: 100%;
+      border-radius: 16px 16px 0 0;
+      padding: 22px 18px;
+      max-height: 85vh;
+    }
+    .modal h2 { font-size: 1rem; }
+    .form-row { grid-template-columns: 1fr; gap: 0; }
+    .modal-actions { flex-direction: column-reverse; }
+    .modal-actions .btn { width: 100%; justify-content: center; padding: 12px; font-size: 0.9rem; }
+
+    /* Import */
+    .col-map-row { flex-direction: column; gap: 8px; }
+    .col-map-item { width: 100%; }
+    .col-map-item select { flex: 1; }
+    .import-actions { flex-direction: column; }
+    .import-actions .btn { width: 100%; justify-content: center; }
+
+    /* Toast */
+    .toast {
+      left: 12px; right: 12px; bottom: 14px;
+      text-align: center; font-size: 0.85rem;
+    }
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="logo">
+    <div class="logo-cross"></div>
+    <div class="logo-text">
+      <h1>성 김대건 성당 도서관</h1>
+      <p>St. Andrew Kim Parish · Chicago</p>
+    </div>
+  </div>
+  <div class="header-stats">
+    <div class="hstat"><div class="hstat-num" id="stat-total">0</div><div class="hstat-label">전체 도서</div></div>
+    <div class="hstat"><div class="hstat-num" id="stat-avail">0</div><div class="hstat-label">대출 가능</div></div>
+    <div class="hstat"><div class="hstat-num" id="stat-borrow">0</div><div class="hstat-label">대출 중</div></div>
+    <div class="hstat"><div class="hstat-num" id="stat-members">0</div><div class="hstat-label">회원</div></div>
+  </div>
+</header>
+
+<!-- NAV -->
+<nav>
+  <button class="tab active" onclick="showPage('books',this)">📚 도서 목록</button>
+  <button class="tab" onclick="showPage('import',this)">📥 엑셀 가져오기</button>
+  <button class="tab" onclick="showPage('borrow',this)">🔄 대출 / 반납</button>
+  <button class="tab" onclick="showPage('members',this)">👥 회원 관리</button>
+  <button class="tab" onclick="showPage('dashboard',this)">📊 현황판</button>
+</nav>
+
+<main>
+
+<!-- ===== 도서 목록 ===== -->
+<div id="page-books" class="page active">
+  <div class="section-header">
+    <div><h2>📚 도서 목록</h2><p>도서관 전체 도서를 관리합니다</p></div>
+    <div class="section-actions">
+      <button class="btn btn-primary" onclick="openModal('add-book')">＋ 도서 추가</button>
+    </div>
+  </div>
+  <div class="search-bar">
+    <div class="search-wrap">
+      <span class="search-icon">🔍</span>
+      <input type="text" id="book-search" placeholder="제목, 저자, 분류로 검색…" oninput="renderBooks()">
+    </div>
+    <select class="filter" id="book-cat" onchange="renderBooks()">
+      <option value="">전체 분류</option>
+      <option>성경공부</option><option>경건</option><option>신학</option>
+      <option>기독교 생활</option><option>기도</option><option>어린이</option>
+      <option>역사</option><option>소설</option><option>기타</option>
+    </select>
+    <select class="filter" id="book-status" onchange="renderBooks()">
+      <option value="">전체 상태</option>
+      <option value="available">대출 가능</option>
+      <option value="borrowed">대출 중</option>
+    </select>
+  </div>
+  <div id="books-count" style="font-size:0.8rem;color:var(--text3);margin-bottom:12px;"></div>
+  <div class="books-grid" id="books-grid"></div>
+</div>
+
+<!-- ===== 엑셀 가져오기 ===== -->
+<div id="page-import" class="page">
+  <div class="section-header">
+    <div><h2>📥 엑셀 파일 가져오기</h2><p>기존 도서 목록을 엑셀에서 불러옵니다</p></div>
+  </div>
+
+  <div class="upload-zone" id="upload-zone">
+    <input type="file" id="excel-file" accept=".xlsx,.xls,.csv" onchange="handleFile(this.files[0])">
+    <div class="upload-icon">📊</div>
+    <h3>엑셀 파일을 여기에 끌어다 놓거나 클릭하여 선택하세요</h3>
+    <p>지원 형식: .xlsx, .csv</p>
+    <span class="hint">제목 / 저자 열이 포함된 파일</span>
+  </div>
+
+  <div class="preview-box" id="preview-box">
+    <div class="preview-header">
+      <h3 id="preview-title">미리보기</h3>
+      <span id="preview-count" style="font-size:0.8rem;color:var(--text3);"></span>
+    </div>
+    <div class="preview-scroll">
+      <table id="preview-table"></table>
+    </div>
+    <div class="col-map">
+      <h4>📌 열 매핑 — 어떤 열이 제목/저자인지 선택하세요</h4>
+      <div class="col-map-row">
+        <div class="col-map-item">
+          <label>제목 열:</label>
+          <select id="map-title"></select>
+        </div>
+        <div class="col-map-item">
+          <label>저자 열:</label>
+          <select id="map-author"></select>
+        </div>
+        <div class="col-map-item">
+          <label>분류 열 (선택):</label>
+          <select id="map-cat"><option value="">(없음)</option></select>
+        </div>
+        <div class="col-map-item">
+          <label>연도 열 (선택):</label>
+          <select id="map-year"><option value="">(없음)</option></select>
+        </div>
+      </div>
+      <div class="import-actions">
+        <button class="btn btn-gold" onclick="importBooks()">✅ 도서 가져오기</button>
+        <button class="btn btn-secondary" onclick="clearImport()">✕ 취소</button>
+      </div>
+    </div>
+  </div>
+
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:20px;box-shadow:var(--shadow);">
+    <h3 style="font-family:'Noto Serif KR',serif;font-size:0.95rem;color:var(--accent);margin-bottom:12px;">📋 엑셀 파일 형식 안내</h3>
+    <p style="font-size:0.85rem;color:var(--text2);line-height:1.8;">
+      엑셀 파일의 <strong>첫 번째 행</strong>은 열 제목이어야 합니다.<br>
+      <code style="background:var(--bg3);padding:2px 6px;border-radius:3px;">.xlsx</code>, 
+      <code style="background:var(--bg3);padding:2px 6px;border-radius:3px;">.csv</code> 형식 지원
+    </p>
+  </div>
+</div>
+
+<!-- ===== 대출 / 반납 ===== -->
+<div id="page-borrow" class="page">
+  <div class="section-header">
+    <div><h2>🔄 대출 / 반납</h2><p>도서 대출 현황을 관리합니다</p></div>
+    <button class="btn btn-primary" onclick="openBorrowModal()">＋ 대출 등록</button>
+  </div>
+  <div class="search-bar">
+    <div class="search-wrap">
+      <span class="search-icon">🔍</span>
+      <input type="text" id="borrow-search" placeholder="도서명 또는 회원명 검색…" oninput="renderBorrows()">
+    </div>
+    <select class="filter" id="borrow-filter" onchange="renderBorrows()">
+      <option value="">전체</option>
+      <option value="active">대출 중</option>
+      <option value="overdue">연체</option>
+      <option value="returned">반납 완료</option>
+    </select>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>도서명</th><th>회원명</th><th>대출일</th><th>반납 예정일</th><th>수납 내역</th><th>상태</th><th>처리</th>
+      </tr></thead>
+      <tbody id="borrow-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===== 회원 관리 ===== -->
+<div id="page-members" class="page">
+  <div class="section-header">
+    <div><h2>👥 회원 관리</h2><p>도서관 이용 회원을 관리합니다</p></div>
+    <button class="btn btn-primary" onclick="openModal('add-member')">＋ 회원 추가</button>
+  </div>
+  <div class="search-bar">
+    <div class="search-wrap">
+      <span class="search-icon">🔍</span>
+      <input type="text" id="member-search" placeholder="이름, 연락처 검색…" oninput="renderMembers()">
+    </div>
+  </div>
+  <div class="members-grid" id="members-grid"></div>
+</div>
+
+<!-- ===== 현황판 ===== -->
+<div id="page-dashboard" class="page">
+  <div class="section-header">
+    <div><h2>📊 현황판</h2><p>도서관 전체 현황을 한눈에 확인합니다</p></div>
+  </div>
+  <div class="dash-grid" id="dash-grid"></div>
+  <div class="dash-two">
+    <div class="dash-section">
+      <h3>📖 최근 추가 도서</h3>
+      <div id="recent-books"></div>
+    </div>
+    <div class="dash-section">
+      <h3>⚠️ 연체 도서</h3>
+      <div id="overdue-list"></div>
+    </div>
+  </div>
+</div>
+
+</main>
+
+<!-- ===== MODALS ===== -->
+
+<!-- 도서 추가 -->
+<div class="modal-overlay" id="modal-add-book">
+  <div class="modal">
+    <h2>📗 도서 추가</h2>
+    <div class="form-row">
+      <div class="form-group"><label>제목 *</label><input id="b-title" placeholder="도서 제목"></div>
+      <div class="form-group"><label>저자 *</label><input id="b-author" placeholder="저자명"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>분류</label>
+        <select id="b-cat">
+          <option>성경공부</option><option>경건</option><option>신학</option>
+          <option>기독교 생활</option><option>기도</option><option>어린이</option>
+          <option>역사</option><option>소설</option><option>기타</option>
+        </select>
+      </div>
+      <div class="form-group"><label>출판 연도</label><input id="b-year" type="number" placeholder="예: 2023"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>ISBN</label><input id="b-isbn" placeholder="선택 사항"></div>
+      <div class="form-group"><label>권수</label><input id="b-copies" type="number" value="1" min="1"></div>
+    </div>
+    <div class="form-group"><label>메모</label><textarea id="b-notes" rows="2" placeholder="선택 사항"></textarea></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('add-book')">취소</button>
+      <button class="btn btn-primary" onclick="addBook()">추가</button>
+    </div>
+  </div>
+</div>
+
+<!-- 도서 수정 -->
+<div class="modal-overlay" id="modal-edit-book">
+  <div class="modal">
+    <h2>✏️ 도서 수정</h2>
+    <input type="hidden" id="eb-id">
+    <div class="form-row">
+      <div class="form-group"><label>제목 *</label><input id="eb-title"></div>
+      <div class="form-group"><label>저자 *</label><input id="eb-author"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>분류</label>
+        <select id="eb-cat">
+          <option>성경공부</option><option>경건</option><option>신학</option>
+          <option>기독교 생활</option><option>기도</option><option>어린이</option>
+          <option>역사</option><option>소설</option><option>기타</option>
+        </select>
+      </div>
+      <div class="form-group"><label>출판 연도</label><input id="eb-year" type="number"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>ISBN</label><input id="eb-isbn"></div>
+      <div class="form-group"><label>권수</label><input id="eb-copies" type="number" min="1"></div>
+    </div>
+    <div class="form-group"><label>메모</label><textarea id="eb-notes" rows="2"></textarea></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('edit-book')">취소</button>
+      <button class="btn btn-primary" onclick="saveEdit()">저장</button>
+    </div>
+  </div>
+</div>
+
+<!-- 대출 등록 -->
+<div class="modal-overlay" id="modal-borrow">
+  <div class="modal">
+    <h2>📖 대출 등록</h2>
+    <div class="form-group"><label>도서 선택 *</label>
+      <select id="br-book"><option value="">-- 도서를 선택하세요 --</option></select>
+    </div>
+    <div class="form-group">
+      <label>회원 이름 *</label>
+      <div style="position:relative;">
+        <input type="text" id="br-member-input" placeholder="이름 입력 또는 목록에서 선택…"
+          oninput="filterMemberSuggest(this.value)" autocomplete="off"
+          style="width:100%;padding:9px 13px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:'Noto Sans KR',sans-serif;font-size:0.88rem;outline:none;">
+        <div id="member-suggest" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--border);border-radius:0 0 6px 6px;z-index:50;max-height:160px;overflow-y:auto;box-shadow:var(--shadow2);"></div>
+      </div>
+      <div style="margin-top:6px;font-size:0.75rem;color:var(--text3);">💡 기존 회원 이름을 입력하면 자동완성, 새 이름 입력 시 임시 회원으로 대출됩니다</div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>대출일</label><input id="br-date" type="date"></div>
+      <div class="form-group"><label>반납 예정일</label><input id="br-due" type="date"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>💰 받은 금액 (선택)</label>
+        <div style="display:flex;gap:0;align-items:center;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg2)">
+          <span style="padding:0 10px;font-size:0.9rem;color:var(--text2);background:var(--bg3);border-right:1px solid var(--border);line-height:38px;font-weight:600">$</span>
+          <input id="br-fee" type="number" min="0" step="0.01" placeholder="0.00" style="flex:1;border:none;background:transparent;padding:8px 10px;font-size:0.95rem;outline:none">
+        </div>
+        <input type="hidden" id="br-currency" value="$">
+      </div>
+      <div class="form-group">
+        <label>💳 수납 메모 (선택)</label>
+        <input id="br-fee-note" placeholder="예: 보증금, 대출료 등">
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('borrow')">취소</button>
+      <button class="btn btn-primary" onclick="doBorrow()">대출 확인</button>
+    </div>
+  </div>
+</div>
+
+<!-- 회원 추가 -->
+<div class="modal-overlay" id="modal-add-member">
+  <div class="modal">
+    <h2>👤 회원 추가</h2>
+    <div class="form-row">
+      <div class="form-group"><label>이름 *</label><input id="m-name" placeholder="성명"></div>
+      <div class="form-group"><label>연락처</label><input id="m-phone" placeholder="010-0000-0000"></div>
+    </div>
+    <div class="form-group"><label>이메일</label><input id="m-email" type="email" placeholder="선택 사항"></div>
+    <div class="form-group"><label>메모</label><textarea id="m-notes" rows="2" placeholder="예: 청년부, 찬양팀 등"></textarea></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('add-member')">취소</button>
+      <button class="btn btn-primary" onclick="addMember()">추가</button>
+    </div>
+  </div>
+</div>
+
+<!-- 반납 처리 (연체료) -->
+<div class="modal-overlay" id="modal-return">
+  <div class="modal">
+    <h2>📗 반납 처리</h2>
+    <input type="hidden" id="ret-borrow-id">
+    <div id="ret-book-info" style="background:var(--bg3);border-radius:8px;padding:12px 14px;margin-bottom:16px;font-size:0.9rem;color:var(--text2);line-height:1.7"></div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>💰 연체료 / 추가 수납 (선택)</label>
+        <div style="display:flex;gap:0;align-items:center;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg2)">
+          <span style="padding:0 10px;font-size:0.9rem;color:var(--text2);background:var(--bg3);border-right:1px solid var(--border);line-height:38px;font-weight:600">$</span>
+          <input id="ret-fee" type="number" min="0" step="0.01" placeholder="0.00" style="flex:1;border:none;background:transparent;padding:8px 10px;font-size:0.95rem;outline:none">
+        </div>
+        <input type="hidden" id="ret-currency" value="$">
+      </div>
+      <div class="form-group">
+        <label>💳 수납 메모 (선택)</label>
+        <input id="ret-fee-note" placeholder="예: 연체료, 훼손비 등">
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal('return')">취소</button>
+      <button class="btn btn-success" onclick="doReturnConfirm()">반납 확인</button>
+    </div>
+  </div>
+</div>
+
+<div id="loading-screen" style="position:fixed;inset:0;background:#1a2744;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;color:#fff;font-family:'Apple SD Gothic Neo',sans-serif;">
+  <div style="font-size:2.5rem;margin-bottom:16px">✝</div>
+  <div style="font-size:1.1rem;font-weight:700;margin-bottom:8px">성 김대건 성당 도서관</div>
+  <div style="font-size:0.85rem;color:#c9a84c;margin-bottom:28px">데이터를 불러오는 중...</div>
+  <div style="width:48px;height:48px;border:4px solid rgba(255,255,255,0.2);border-top-color:#c9a84c;border-radius:50%;animation:spin 0.8s linear infinite"></div>
+  <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- Firebase SDK -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-app.js";
+import { getFirestore, collection, doc, getDocs, addDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
+
+// ============ FIREBASE CONFIG ============
+const firebaseConfig = {
+  apiKey: "AIzaSyAT5w85NkgkTaieKpHD0V7qZRWxmFklBgc",
+  authDomain: "standrewkimlibrarychicago.firebaseapp.com",
+  projectId: "standrewkimlibrarychicago",
+  storageBucket: "standrewkimlibrarychicago.firebasestorage.app",
+  messagingSenderId: "968371407699",
+  appId: "1:968371407699:web:bc4a759beb250b6c90afa6"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+// ============ DATA (실시간 Firebase) ============
+let books = [], members = [], borrows = [];
+const today = new Date().toISOString().split('T')[0];
+
+// ============ UTILS ============
+function toastMsg(msg, ok=true) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = ok ? 'var(--accent)' : '#9b2335';
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2800);
+}
+// Keep legacy toast name working
+window.toast = function(msg, ok=true) { toastMsg(msg, ok); };
+
+function openModal(name) { document.getElementById('modal-'+name).classList.add('open'); }
+function closeModal(name) { document.getElementById('modal-'+name).classList.remove('open'); }
+document.querySelectorAll('.modal-overlay').forEach(el =>
+  el.addEventListener('click', e => { if(e.target===el) el.classList.remove('open'); })
+);
+function showPage(name, btn) {
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('page-'+name).classList.add('active');
+  if(btn) btn.classList.add('active');
+  if(name==='books') renderBooks();
+  if(name==='borrow') renderBorrows();
+  if(name==='members') renderMembers();
+  if(name==='dashboard') renderDashboard();
+}
+function updateStats() {
+  const activeBIds = borrows.filter(b=>!b.returnDate).map(b=>b.bookId);
+  const borrowedCount = [...new Set(activeBIds)].length;
+  document.getElementById('stat-total').textContent = books.length;
+  document.getElementById('stat-avail').textContent = books.length - borrowedCount;
+  document.getElementById('stat-borrow').textContent = activeBIds.length;
+  document.getElementById('stat-members').textContent = members.length;
+}
+function isBookBorrowed(id) { return borrows.some(b=>b.bookId===id&&!b.returnDate); }
+
+// ============ REALTIME LISTENERS ============
+function startListeners() {
+  onSnapshot(collection(db,'books'), snap => {
+    books = snap.docs.map(d=>({...d.data(), id:d.id}));
+    renderBooks(); updateStats();
+    if(document.getElementById('page-dashboard').classList.contains('active')) renderDashboard();
+  });
+  onSnapshot(collection(db,'members'), snap => {
+    members = snap.docs.map(d=>({...d.data(), id:d.id}));
+    renderMembers(); updateStats();
+  });
+  onSnapshot(collection(db,'borrows'), snap => {
+    borrows = snap.docs.map(d=>({...d.data(), id:d.id}));
+    renderBorrows(); updateStats();
+    if(document.getElementById('page-dashboard').classList.contains('active')) renderDashboard();
+  });
+  document.getElementById('loading-screen').style.display='none';
+}
+
+// ============ BOOKS ============
+function renderBooks() {
+  const q = document.getElementById('book-search').value.toLowerCase();
+  const cat = document.getElementById('book-cat').value;
+  const st = document.getElementById('book-status').value;
+  let list = books.filter(b => {
+    const m = b.title.toLowerCase().includes(q)||b.author.toLowerCase().includes(q)||(b.category||'').toLowerCase().includes(q);
+    const cm = !cat || b.category===cat;
+    const borrowed = isBookBorrowed(b.id);
+    const sm = !st || (st==='available'&&!borrowed)||(st==='borrowed'&&borrowed);
+    return m&&cm&&sm;
+  });
+  document.getElementById('books-count').textContent = `총 ${list.length}권`;
+  const grid = document.getElementById('books-grid');
+  if(!list.length) { grid.innerHTML='<div class="empty"><div class="eicon">📚</div><p>검색 결과가 없습니다</p></div>'; return; }
+  grid.innerHTML = list.map(b => {
+    const borrowed = isBookBorrowed(b.id);
+    const bRecord = borrows.find(r=>r.bookId===b.id&&!r.returnDate);
+    const borrower = bRecord ? members.find(m=>m.id===bRecord.memberId)?.name : null;
+    return `<div class="book-card ${borrowed?'borrowed':''}">
+      <div class="book-spine"></div>
+      <div style="padding-left:8px">
+        <div class="book-title">${b.title}</div>
+        <div class="book-author">${b.author}</div>
+        <div class="book-meta">
+          ${b.category?`<span class="tag">${b.category}</span>`:''}
+          ${b.year?`<span class="tag">${b.year}</span>`:''}
+          <span class="badge ${borrowed?'badge-borrowed':'badge-available'}">${borrowed?'대출 중':'대출 가능'}</span>
+        </div>
+        ${borrowed&&borrower?`<div class="book-borrower">대출자: ${borrower}</div>`:''}
+        ${b.copies>1?`<div style="font-size:0.75rem;color:var(--text3);margin-bottom:8px;">권수: ${b.copies}</div>`:''}
+        <div class="book-actions">
+          ${!borrowed
+            ?`<button class="btn btn-success btn-sm" onclick="quickBorrow('${b.id}')">대출</button>`
+            :`<button class="btn btn-danger btn-sm" onclick="quickReturn('${b.id}')">반납</button>`}
+          <button class="btn btn-secondary btn-sm" onclick="editBook('${b.id}')">수정</button>
+          <button class="btn btn-secondary btn-sm" onclick="removeBook('${b.id}')">🗑</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+async function addBook() {
+  const title = document.getElementById('b-title').value.trim();
+  const author = document.getElementById('b-author').value.trim();
+  if(!title||!author){toastMsg('제목과 저자를 입력해주세요',false);return;}
+  try {
+    await addDoc(collection(db,'books'), {
+      title, author,
+      category: document.getElementById('b-cat').value,
+      year: parseInt(document.getElementById('b-year').value)||null,
+      isbn: document.getElementById('b-isbn').value.trim(),
+      copies: parseInt(document.getElementById('b-copies').value)||1,
+      notes: document.getElementById('b-notes').value.trim()
+    });
+    ['b-title','b-author','b-year','b-isbn','b-notes'].forEach(id=>document.getElementById(id).value='');
+    document.getElementById('b-copies').value='1';
+    closeModal('add-book');
+    toastMsg('✅ 도서가 추가되었습니다');
+  } catch(e) { toastMsg('오류: '+e.message, false); }
+}
+function editBook(id) {
+  const b = books.find(x=>x.id===id); if(!b) return;
+  document.getElementById('eb-id').value=id;
+  document.getElementById('eb-title').value=b.title;
+  document.getElementById('eb-author').value=b.author;
+  document.getElementById('eb-cat').value=b.category||'기타';
+  document.getElementById('eb-year').value=b.year||'';
+  document.getElementById('eb-isbn').value=b.isbn||'';
+  document.getElementById('eb-copies').value=b.copies||1;
+  document.getElementById('eb-notes').value=b.notes||'';
+  openModal('edit-book');
+}
+async function saveEdit() {
+  const id = document.getElementById('eb-id').value;
+  try {
+    await updateDoc(doc(db,'books',id), {
+      title: document.getElementById('eb-title').value.trim(),
+      author: document.getElementById('eb-author').value.trim(),
+      category: document.getElementById('eb-cat').value,
+      year: parseInt(document.getElementById('eb-year').value)||null,
+      isbn: document.getElementById('eb-isbn').value.trim(),
+      copies: parseInt(document.getElementById('eb-copies').value)||1,
+      notes: document.getElementById('eb-notes').value.trim()
+    });
+    closeModal('edit-book');
+    toastMsg('✅ 수정되었습니다');
+  } catch(e) { toastMsg('오류: '+e.message, false); }
+}
+async function removeBook(id) {
+  if(isBookBorrowed(id)){toastMsg('대출 중인 도서는 삭제할 수 없습니다',false);return;}
+  if(!confirm('이 도서를 삭제하시겠습니까?'))return;
+  await deleteDoc(doc(db,'books',id));
+  toastMsg('🗑 삭제되었습니다');
+}
+function quickBorrow(bookId) {
+  populateBorrowSelects();
+  document.getElementById('br-book').value=bookId;
+  openModal('borrow');
+}
+function quickReturn(bookId) {
+  const r=borrows.find(b=>b.bookId===bookId&&!b.returnDate);
+  if(r) doReturn(r.id);
+}
+
+// ============ EXCEL IMPORT ============
+let importedData = [], importHeaders = [];
+const uploadZone = document.getElementById('upload-zone');
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault(); uploadZone.classList.remove('dragover');
+  if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+async function handleFile(file) {
+  if(!file) return;
+  const ext = file.name.split('.').pop().toLowerCase();
+  if(!['xlsx','csv'].includes(ext)){toastMsg('.xlsx 또는 .csv 파일만 지원합니다',false);return;}
+  try {
+    const data = await MiniXLSX.read(file);
+    if(data.length < 2){toastMsg('데이터가 없습니다',false);return;}
+    importHeaders = data[0].map(h=>String(h).trim());
+    importedData = data.slice(1).filter(r=>r.some(c=>c!==''));
+    showPreview(file.name);
+  } catch(err) { toastMsg('파일을 읽는 중 오류가 발생했습니다: ' + err.message, false); }
+}
+function showPreview(filename) {
+  const box = document.getElementById('preview-box');
+  box.style.display = 'block';
+  document.getElementById('preview-title').textContent = `📄 ${filename}`;
+  document.getElementById('preview-count').textContent = `${importedData.length}행 감지됨`;
+  const table = document.getElementById('preview-table');
+  const previewRows = importedData.slice(0,5);
+  table.innerHTML = `<thead><tr>${importHeaders.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
+    <tbody>${previewRows.map(r=>`<tr>${importHeaders.map((_,i)=>`<td>${r[i]||''}</td>`).join('')}</tr>`).join('')}</tbody>`;
+  ['map-title','map-author','map-cat','map-year'].forEach(id=>{
+    const sel = document.getElementById(id);
+    const hasNone = id==='map-cat'||id==='map-year';
+    sel.innerHTML = (hasNone?'<option value="">(없음)</option>':'') + importHeaders.map((h,i)=>`<option value="${i}">${h}</option>`).join('');
+  });
+  const titleKeywords = ['제목','title','책이름','도서명','book'];
+  const authorKeywords = ['저자','author','작가','글쓴이','writer'];
+  const catKeywords = ['분류','카테고리','category','장르','genre'];
+  const yearKeywords = ['연도','year','출판연도','출판년도'];
+  const detect = (kw) => { const idx=importHeaders.findIndex(h=>kw.some(k=>h.toLowerCase().includes(k))); return idx>=0?String(idx):''; };
+  document.getElementById('map-title').value = detect(titleKeywords)||'0';
+  document.getElementById('map-author').value = detect(authorKeywords)||(importHeaders.length>1?'1':'0');
+  document.getElementById('map-cat').value = detect(catKeywords);
+  document.getElementById('map-year').value = detect(yearKeywords);
+}
+async function importBooks() {
+  const ti=document.getElementById('map-title').value;
+  const ai=document.getElementById('map-author').value;
+  const ci=document.getElementById('map-cat').value;
+  const yi=document.getElementById('map-year').value;
+  if(ti===''||ai===''){toastMsg('제목과 저자 열을 선택해주세요',false);return;}
+  let added=0, skipped=0;
+  toastMsg('⏳ Firebase에 업로드 중...');
+  for(const row of importedData) {
+    const title = String(row[parseInt(ti)]||'').trim();
+    const author = String(row[parseInt(ai)]||'').trim();
+    if(!title){skipped++;continue;}
+    await addDoc(collection(db,'books'), {
+      title, author,
+      category: ci!==''?String(row[parseInt(ci)]||'').trim()||'기타':'기타',
+      year: yi!==''?parseInt(row[parseInt(yi)])||null:null,
+      isbn:'', copies:1, notes:''
+    });
+    added++;
+  }
+  clearImport();
+  toastMsg(`✅ ${added}권이 추가되었습니다${skipped?` (${skipped}행 건너뜀)`:''}`);
+  showPage('books', document.querySelector('.tab'));
+}
+function clearImport() {
+  document.getElementById('preview-box').style.display='none';
+  document.getElementById('excel-file').value='';
+  importedData=[]; importHeaders=[];
+}
+
+// ============ BORROWS ============
+function populateBorrowSelects() {
+  document.getElementById('br-book').innerHTML = '<option value="">-- 도서를 선택하세요 --</option>' +
+    books.filter(b=>!isBookBorrowed(b.id)).map(b=>`<option value="${b.id}">${b.title} — ${b.author}</option>`).join('');
+  document.getElementById('br-member-input').value='';
+  document.getElementById('member-suggest').style.display='none';
+  document.getElementById('br-date').value=today;
+  const due=new Date(); due.setDate(due.getDate()+14);
+  document.getElementById('br-due').value=due.toISOString().split('T')[0];
+}
+function filterMemberSuggest(val) {
+  const box=document.getElementById('member-suggest');
+  if(!val.trim()){box.style.display='none';return;}
+  const matched=members.filter(m=>m.name.toLowerCase().includes(val.toLowerCase()));
+  if(!matched.length){box.style.display='none';return;}
+  box.innerHTML=matched.map(m=>`
+    <div onclick="selectMember('${m.name.replace(/'/g,"\'")}','${m.id}')"
+      style="padding:9px 14px;cursor:pointer;font-size:0.88rem;border-bottom:1px solid var(--border2);"
+      onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
+      ${m.name}${m.notes?`<span style="font-size:0.75rem;color:var(--text3);margin-left:6px">${m.notes}</span>`:''}
+    </div>`).join('');
+  box.style.display='block';
+}
+function selectMember(name, id) {
+  document.getElementById('br-member-input').value=name;
+  document.getElementById('br-member-input').dataset.memberId=id;
+  document.getElementById('member-suggest').style.display='none';
+}
+document.addEventListener('click', e => {
+  if(!e.target.closest('#modal-borrow')) {
+    const box=document.getElementById('member-suggest');
+    if(box) box.style.display='none';
+  }
+});
+function openBorrowModal() { populateBorrowSelects(); openModal('borrow'); }
+async function doBorrow() {
+  const bookId=document.getElementById('br-book').value;
+  const borrowDate=document.getElementById('br-date').value;
+  const dueDate=document.getElementById('br-due').value;
+  const memberInput=document.getElementById('br-member-input');
+  const memberName=memberInput.value.trim();
+  if(!bookId||!memberName||!borrowDate||!dueDate){toastMsg('모든 항목을 입력해주세요',false);return;}
+  let memberId=memberInput.dataset.memberId||null;
+  if(!memberId||!members.find(m=>m.id===memberId&&m.name===memberName)) {
+    const existing=members.find(m=>m.name===memberName);
+    if(existing) { memberId=existing.id; }
+    else {
+      const ref=await addDoc(collection(db,'members'),{name:memberName,phone:'',email:'',notes:'임시 등록'});
+      memberId=ref.id;
+      toastMsg(`👤 "${memberName}" 회원이 자동 등록되었습니다`);
+    }
+  }
+  const fee=parseFloat(document.getElementById('br-fee').value)||0;
+  const feeCurrency=document.getElementById('br-currency').value;
+  const feeNote=document.getElementById('br-fee-note').value.trim();
+  memberInput.dataset.memberId='';
+  document.getElementById('br-fee').value='';
+  document.getElementById('br-fee-note').value='';
+  await addDoc(collection(db,'borrows'),{
+    bookId, memberId, borrowDate, dueDate, returnDate:null,
+    borrowFee:fee||null, borrowFeeCurrency:feeCurrency, borrowFeeNote:feeNote||null,
+    returnFee:null, returnFeeCurrency:'$', returnFeeNote:null
+  });
+  closeModal('borrow');
+  const feeMsg=fee?` ($${fee.toFixed(2)} 수납)`:'';
+  toastMsg('📖 대출 처리되었습니다'+feeMsg);
+}
+function doReturn(bid) {
+  const r=borrows.find(b=>b.id===bid); if(!r) return;
+  const book=books.find(x=>x.id===r.bookId);
+  const mem=members.find(x=>x.id===r.memberId);
+  const overdue=r.dueDate<today;
+  document.getElementById('ret-borrow-id').value=bid;
+  document.getElementById('ret-book-info').innerHTML=
+    `<strong>${book?.title||'?'}</strong> · ${mem?.name||'?'}<br>
+     대출일: ${r.borrowDate} &nbsp;·&nbsp; 반납 예정: <span style="color:${overdue?'var(--red)':'inherit'};font-weight:${overdue?700:400}">${r.dueDate}${overdue?' ⚠ 연체':''}</span>
+     ${r.borrowFee?`<br>대출 시 수납: <strong>$${Number(r.borrowFee).toFixed(2)}</strong>${r.borrowFeeNote?' ('+r.borrowFeeNote+')':''}`:'' }`;
+  document.getElementById('ret-fee').value='';
+  document.getElementById('ret-fee-note').value='';
+  openModal('return');
+}
+async function doReturnConfirm() {
+  const bid=document.getElementById('ret-borrow-id').value;
+  const r=borrows.find(b=>b.id===bid); if(!r) return;
+  const fee=parseFloat(document.getElementById('ret-fee').value)||0;
+  const feeNote=document.getElementById('ret-fee-note').value.trim();
+  await updateDoc(doc(db,'borrows',bid),{
+    returnDate:today,
+    returnFee:fee||null,
+    returnFeeCurrency:'$',
+    returnFeeNote:feeNote||null
+  });
+  closeModal('return');
+  const feeMsg=fee?` ($${fee.toFixed(2)} 수납)`:'';
+  toastMsg('📗 반납 처리되었습니다'+feeMsg);
+}
+function renderBorrows() {
+  const q=document.getElementById('borrow-search').value.toLowerCase();
+  const f=document.getElementById('borrow-filter').value;
+  let list=borrows.filter(b=>{
+    const book=books.find(x=>x.id===b.bookId);
+    const mem=members.find(x=>x.id===b.memberId);
+    const match=(book?.title||'').toLowerCase().includes(q)||(mem?.name||'').toLowerCase().includes(q);
+    const overdue=!b.returnDate&&b.dueDate<today;
+    const sm=!f||(f==='active'&&!b.returnDate&&!overdue)||(f==='overdue'&&overdue)||(f==='returned'&&b.returnDate);
+    return match&&sm;
+  });
+  const tbody=document.getElementById('borrow-tbody');
+  if(!list.length){tbody.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:36px">데이터가 없습니다</td></tr>';return;}
+  tbody.innerHTML=list.map(b=>{
+    const book=books.find(x=>x.id===b.bookId);
+    const mem=members.find(x=>x.id===b.memberId);
+    const overdue=!b.returnDate&&b.dueDate<today;
+    const statusHtml=b.returnDate
+      ?`<span class="badge badge-available">반납 완료</span>`
+      :overdue?`<span class="badge badge-borrowed">연체</span>`
+      :`<span class="badge badge-available">대출 중</span>`;
+    const fees=[];
+    if(b.borrowFee) fees.push(`<span style="color:var(--green);font-size:0.8rem">📥 대출 $${Number(b.borrowFee).toFixed(2)}${b.borrowFeeNote?' ('+b.borrowFeeNote+')':''}</span>`);
+    if(b.returnFee) fees.push(`<span style="color:var(--blue);font-size:0.8rem">📤 반납 $${Number(b.returnFee).toFixed(2)}${b.returnFeeNote?' ('+b.returnFeeNote+')':''}</span>`);
+    const feeHtml=fees.length?fees.join('<br>'):'<span style="color:var(--text3);font-size:0.8rem">-</span>';
+    return `<tr>
+      <td data-label="도서명"><strong>${book?.title||'알 수 없음'}</strong></td>
+      <td data-label="회원명">${mem?.name||'알 수 없음'}</td>
+      <td data-label="대출일">${b.borrowDate}</td>
+      <td data-label="반납 예정" class="${overdue?'overdue-text':''}">${b.dueDate}</td>
+      <td data-label="수납 내역">${feeHtml}</td>
+      <td data-label="상태">${statusHtml}</td>
+      <td>${!b.returnDate?`<button class="btn btn-success btn-sm" onclick="doReturn('${b.id}')">반납</button>`:b.returnDate}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ============ MEMBERS ============
+function renderMembers() {
+  const q=document.getElementById('member-search').value.toLowerCase();
+  let list=members.filter(m=>m.name.toLowerCase().includes(q)||(m.phone||'').includes(q));
+  const grid=document.getElementById('members-grid');
+  if(!list.length){grid.innerHTML='<div class="empty"><div class="eicon">👥</div><p>회원이 없습니다</p></div>';return;}
+  grid.innerHTML=list.map(m=>{
+    const active=borrows.filter(b=>b.memberId===m.id&&!b.returnDate).length;
+    const total=borrows.filter(b=>b.memberId===m.id).length;
+    const initials=m.name.slice(0,1);
+    return `<div class="member-card">
+      <div class="member-top">
+        <div class="avatar">${initials}</div>
+        <div>
+          <div class="member-name">${m.name}</div>
+          <div class="member-info">${m.phone||''}${m.notes?` · ${m.notes}`:''}</div>
+        </div>
+      </div>
+      <div class="member-stats">
+        <div class="mstat">현재 대출: <span>${active}</span></div>
+        <div class="mstat">전체 대출: <span>${total}</span></div>
+      </div>
+      <div class="member-actions">
+        <button class="btn btn-secondary btn-sm" onclick="removeMember('${m.id}')">🗑 삭제</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+async function addMember() {
+  const name=document.getElementById('m-name').value.trim();
+  if(!name){toastMsg('이름을 입력해주세요',false);return;}
+  await addDoc(collection(db,'members'),{
+    name, phone:document.getElementById('m-phone').value.trim(),
+    email:document.getElementById('m-email').value.trim(),
+    notes:document.getElementById('m-notes').value.trim()
+  });
+  ['m-name','m-phone','m-email','m-notes'].forEach(id=>document.getElementById(id).value='');
+  closeModal('add-member');
+  toastMsg('✅ 회원이 추가되었습니다');
+}
+async function removeMember(id) {
+  if(borrows.some(b=>b.memberId===id&&!b.returnDate)){toastMsg('대출 중인 도서가 있어 삭제할 수 없습니다',false);return;}
+  if(!confirm('이 회원을 삭제하시겠습니까?'))return;
+  await deleteDoc(doc(db,'members',id));
+  toastMsg('🗑 삭제되었습니다');
+}
+
+// ============ DASHBOARD ============
+function renderDashboard() {
+  const active=borrows.filter(b=>!b.returnDate);
+  const overdue=active.filter(b=>b.dueDate<today);
+  const borrowedBookIds=[...new Set(active.map(b=>b.bookId))];
+  document.getElementById('dash-grid').innerHTML=[
+    {icon:'📚',num:books.length,label:'전체 도서'},
+    {icon:'✅',num:books.length-borrowedBookIds.length,label:'대출 가능'},
+    {icon:'📖',num:active.length,label:'대출 중'},
+    {icon:'⚠️',num:overdue.length,label:'연체',red:true},
+    {icon:'👥',num:members.length,label:'전체 회원'},
+    {icon:'🔄',num:borrows.filter(b=>b.returnDate).length,label:'누적 반납'},
+  ].map(c=>`<div class="dash-card">
+    <div class="dash-icon">${c.icon}</div>
+    <div class="dash-num" ${c.red?'style="color:var(--red)"':''}>${c.num}</div>
+    <div class="dash-label">${c.label}</div>
+  </div>`).join('');
+  document.getElementById('recent-books').innerHTML=books.slice(-5).reverse().map(b=>`
+    <div class="dash-item">
+      <div><div class="dash-item-title">${b.title}</div><div class="dash-item-sub">${b.author}</div></div>
+      <span class="tag">${b.category||'기타'}</span>
+    </div>`).join('')||'<p style="color:var(--text3);font-size:0.85rem">도서가 없습니다</p>';
+  document.getElementById('overdue-list').innerHTML=overdue.length
+    ?overdue.map(b=>{
+        const book=books.find(x=>x.id===b.bookId);
+        const mem=members.find(x=>x.id===b.memberId);
+        const days=Math.floor((new Date(today)-new Date(b.dueDate))/86400000);
+        return `<div class="dash-item">
+          <div><div class="dash-item-title">${book?.title||'알 수 없음'}</div>
+          <div class="dash-item-sub">${mem?.name} · <span style="color:var(--red)">${days}일 연체</span></div></div>
+        </div>`;
+      }).join('')
+    :'<p style="color:var(--green);font-size:0.85rem">연체 도서가 없습니다 🎉</p>';
+}
+
+// ============ EXPOSE GLOBALS & INIT ============
+window.openModal=openModal; window.closeModal=closeModal; window.showPage=showPage;
+window.addBook=addBook; window.editBook=editBook; window.saveEdit=saveEdit;
+window.removeBook=removeBook; window.quickBorrow=quickBorrow; window.quickReturn=quickReturn;
+window.openBorrowModal=openBorrowModal; window.doBorrow=doBorrow;
+window.doReturn=doReturn; window.doReturnConfirm=doReturnConfirm;
+window.addMember=addMember; window.removeMember=removeMember;
+window.filterMemberSuggest=filterMemberSuggest; window.selectMember=selectMember;
+window.handleFile=handleFile; window.importBooks=importBooks; window.clearImport=clearImport;
+window.renderBooks=renderBooks; window.renderBorrows=renderBorrows;
+window.renderMembers=renderMembers; window.renderDashboard=renderDashboard;
+
+startListeners();
+</script>
+</body>
+</html>
